@@ -1192,6 +1192,49 @@ class ResolveClickBody(BaseModel):
     trace_id: str | None = None
 
 
+class CaptionSeedBody(BaseModel):
+    image_data_url: str
+    output_locale: str | None = None
+    trace_id: str | None = None
+
+
+@fastapi_app.post("/caption-seed")
+async def caption_seed(req: Request, body: CaptionSeedBody):
+    """VLM-title an uploaded seed image so later taps plan against the real theme.
+
+    Used by /play's upload path instead of the hard-coded "Uploaded image" stub.
+    """
+    from obs import TRACE_HEADER, bind_trace, record_error
+    from providers import llm as llm_provider
+
+    limited = _rate_limited(req)
+    if limited is not None:
+        return limited
+
+    trace_id = bind_trace(req.headers.get(TRACE_HEADER) or body.trace_id)
+    try:
+        caption = await llm_provider.caption_seed_image(
+            image_data_url=body.image_data_url,
+            output_locale=body.output_locale,
+        )
+    except Exception as exc:
+        record_error("caption_seed", exc)
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {exc}", "trace_id": trace_id},
+            status_code=502,
+            headers={"X-Trace-Id": trace_id},
+        )
+    return JSONResponse(
+        {
+            "page_title": caption.page_title,
+            "query": caption.query,
+            "description": caption.description,
+            "trace_id": trace_id,
+        },
+        headers={"X-Trace-Id": trace_id},
+    )
+
+
 @fastapi_app.post("/resolve-click")
 async def resolve_click(req: Request, body: ResolveClickBody):
     """Hover-prefetch endpoint.
