@@ -49,7 +49,12 @@ export function postcardLayout(
         style={{
           width: WIDTH,
           height: IMAGE_HEIGHT,
-          objectFit: "cover",
+          // Contain (not cover): play pages are 16:9; the postcard image band
+          // is near-square. Cover was cropping the illustration; contain keeps
+          // the whole page visible on the paper ground.
+          objectFit: "contain",
+          objectPosition: "center",
+          backgroundColor: PAPER,
           display: "flex",
         }}
       />
