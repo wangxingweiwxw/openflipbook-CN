@@ -7,12 +7,64 @@ that monkeypatch `providers.llm._client` / `_complete_json` still intercept.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 
 from providers import llm as _llm
 
 from .client import _coerce_scale, _system_message, _vlm_model
+
+# Near-duplicate threshold for "subject restates the parent title" detection.
+# Exact equality is the common silent-failure mode (empty VLM → parent_title
+# fallback); high ratio catches planner-ish restatements of the same theme.
+_PARENT_ECHO_RATIO = 0.85
+
+
+def _normalize_subject(s: str) -> str:
+    """lowercase → strip diacritics/punct → collapse spaces. Keeps CJK letters."""
+    folded = unicodedata.normalize("NFKD", (s or "").lower())
+    folded = folded.replace("'", "").replace("\u2019", "")
+    stripped = "".join(c for c in folded if not unicodedata.combining(c))
+    alnum = "".join(c if c.isalnum() else " " for c in stripped)
+    return " ".join(alnum.split())
+
+
+def subject_echoes_parent(subject: str, *parents: str | None) -> bool:
+    """True when ``subject`` is empty or a restatement of a parent title/query.
+
+    The classic stuck-trail failure: VLM parse fails → subject falls back to
+    ``parent_title`` → planner regenerates the same page → breadcrumb shows
+    identical titles. Also rejects near-duplicate titles and compact CJK
+    substrings that are most of the parent string.
+    """
+    sn = _normalize_subject(subject)
+    if not sn:
+        return True
+    for p in parents:
+        if not p or not str(p).strip():
+            continue
+        pn = _normalize_subject(str(p))
+        if not pn:
+            continue
+        if sn == pn:
+            return True
+        if SequenceMatcher(None, sn, pn).ratio() >= _PARENT_ECHO_RATIO:
+            return True
+        # Compact CJK titles have no spaces — only treat as echo when the
+        # shorter string is a large fraction of the longer (avoids rejecting
+        # a specific detail like "龙袍" just because a character name appears
+        # inside a long poetic parent title).
+        if " " not in sn and " " not in pn:
+            shorter, longer = (sn, pn) if len(sn) <= len(pn) else (pn, sn)
+            if (
+                len(shorter) >= 4
+                and shorter in longer
+                and len(shorter) / len(longer) >= 0.55
+            ):
+                return True
+    return False
 
 
 @dataclass
@@ -218,9 +270,14 @@ async def click_to_subject(
         f"'{parent_title}' (user query: '{parent_query}'). A red crosshair with "
         "a white halo has been drawn on the image to mark where the user "
         "clicked. Return ONE JSON object with these fields: "
-        "(1) `subject` — a 2-8 word noun phrase naming the specific thing "
-        "under the crosshair (ignore the crosshair itself); should make a "
-        "good next query for a visual explainer. "
+        "(1) `subject` — a 2-8 word noun phrase naming the specific LOCAL "
+        "detail under the crosshair (ignore the crosshair itself): an object, "
+        "garment, prop, building part, label, or region. Do NOT return the "
+        f"page title, do NOT restate '{parent_title}', and do NOT name the "
+        "page's overall theme/main character unless the crosshair is on a "
+        "smaller DISTINCT part of them — prefer the most specific noun at "
+        "that point. The subject should make a good next query for a visual "
+        "explainer that drills INTO that detail. "
         "(2) `style` — a single sentence (<=30 words) describing the "
         "illustration's visual style: art medium (e.g. flat infographic, "
         "watercolor, technical line drawing, photoreal, anime, blueprint), "

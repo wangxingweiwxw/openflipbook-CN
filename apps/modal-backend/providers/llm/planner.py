@@ -21,6 +21,11 @@ from .client import (
     _vlm_model,
     _web_plugin_extra,
 )
+from .google_grounding import (
+    _google_grounding_enabled,
+    complete_plan_json_with_google_grounding,
+    native_gemini_model,
+)
 
 
 @dataclass
@@ -37,6 +42,15 @@ class PagePlan:
     sources: list[Citation]
 
 
+@dataclass
+class SeedCaption:
+    """VLM read of an uploaded seed image — replaces the "Uploaded image" stub."""
+
+    page_title: str
+    query: str
+    description: str
+
+
 PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -45,6 +59,16 @@ PLAN_SCHEMA: dict[str, Any] = {
         "facts": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["page_title", "prompt"],
+}
+
+SEED_CAPTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "page_title": {"type": "string"},
+        "query": {"type": "string"},
+        "description": {"type": "string"},
+    },
+    "required": ["page_title"],
 }
 
 
@@ -187,7 +211,9 @@ async def plan_page(
             f"CHILD of the parent page \"{parent}\". The page you design "
             "MUST stay in the parent's domain — do NOT drift to a different "
             "field even if web search surfaces a more popular meaning of "
-            "the subject phrase."
+            "the subject phrase. The `page_title` MUST name the Query "
+            "subject itself (the thing they clicked) — do NOT restate or "
+            "paraphrase the parent page title."
         )
         if anchor:
             clause += (
@@ -278,23 +304,47 @@ async def plan_page(
         user += f"\n\nVisual style to preserve verbatim: {style_anchor}"
     from obs import span
 
-    text_model = _text_model(online=web_search)
+    use_google_grounding = _google_grounding_enabled(web_search)
+    text_model = (
+        native_gemini_model()
+        if use_google_grounding
+        else _text_model(online=web_search)
+    )
     response_sink: list[Any] = []
-    async with span("planner.plan_page", model=text_model, web_search=web_search) as ctx:
-        parsed = await _llm._complete_json(
-            model=text_model,
-            messages=[
-                _system_message(system),
-                {"role": "user", "content": user},
-            ],
-            schema=PLAN_SCHEMA,
-            schema_name="page_plan",
-            temperature=0.7,
-            max_tokens=900,
-            extra_body=_web_plugin_extra(text_model, online=web_search) or None,
-            span_ctx=ctx,
-            response_sink=response_sink,
-        )
+    async with span(
+        "planner.plan_page",
+        model=text_model,
+        web_search=web_search,
+        google_grounding=use_google_grounding,
+    ) as ctx:
+        if use_google_grounding:
+            parsed, grounding_sources = await complete_plan_json_with_google_grounding(
+                model=text_model,
+                system=system,
+                user=user,
+                temperature=0.7,
+                max_tokens=900,
+                span_ctx=ctx,
+            )
+            sources = [
+                Citation(url=c.url, title=c.title) for c in grounding_sources
+            ]
+        else:
+            parsed = await _llm._complete_json(
+                model=text_model,
+                messages=[
+                    _system_message(system),
+                    {"role": "user", "content": user},
+                ],
+                schema=PLAN_SCHEMA,
+                schema_name="page_plan",
+                temperature=0.7,
+                max_tokens=900,
+                extra_body=_web_plugin_extra(text_model, online=web_search) or None,
+                span_ctx=ctx,
+                response_sink=response_sink,
+            )
+            sources = _extract_citations(response_sink[0]) if response_sink else []
     page_title = str(parsed.get("page_title", query)).strip() or query
     prompt = str(parsed.get("prompt", query)).strip() or query
     facts_raw = parsed.get("facts", [])
@@ -303,8 +353,78 @@ async def plan_page(
         for f in facts_raw:
             if isinstance(f, str) and f.strip():
                 facts.append(f.strip())
-    sources = _extract_citations(response_sink[0]) if response_sink else []
     return PagePlan(page_title=page_title, prompt=prompt, facts=facts, sources=sources)
+
+
+async def caption_seed_image(
+    image_data_url: str,
+    output_locale: str | None = None,
+) -> SeedCaption:
+    """Name an uploaded seed image so later taps don't plan against "Uploaded image".
+
+    Returns a short page_title (≤8 words), a slightly richer query phrase used
+    as parent_query on the next hop, and a one-sentence description for the
+    extract path. Failures raise — the upload caller falls back to a stub.
+    """
+    locale = (output_locale or "").strip().lower()
+    lang_clause = ""
+    if locale and locale not in ("en", "auto", ""):
+        lang_clause = (
+            f" Write page_title, query, and description in language code "
+            f"'{locale}'."
+        )
+    system = (
+        "You title a user-uploaded illustration that will become the first "
+        "page of an interactive visual explainer. Look at the image and "
+        "return JSON with keys: page_title (<=8 words, the main subject or "
+        "theme — NOT the words 'uploaded image'), query (one short phrase "
+        "naming what the viewer should explore next from this picture), "
+        "description (one sentence of what's depicted — people, place, "
+        "era, style — so a later planner stays on-topic). Do not invent "
+        "unrelated subjects. Do not include any text outside the JSON."
+        + lang_clause
+    )
+    from obs import span
+
+    # gemini-3-flash spends thinking tokens against max_tokens — keep headroom.
+    async with span("vlm.caption_seed", model=_vlm_model()) as ctx:
+        parsed = await _llm._complete_json(
+            model=_vlm_model(),
+            messages=[
+                _system_message(system),
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Caption this seed image for an explorable page.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url, "detail": "low"},
+                        },
+                    ],
+                },
+            ],
+            schema=SEED_CAPTION_SCHEMA,
+            schema_name="seed_caption",
+            temperature=0.2,
+            max_tokens=1024,
+            span_ctx=ctx,
+        )
+    title = str(parsed.get("page_title") or "").strip()
+    query = str(parsed.get("query") or "").strip() or title
+    description = str(parsed.get("description") or "").strip()
+    # Guard against the model echoing the stub we want to kill.
+    stubby = title.lower().replace(" ", "") in (
+        "uploadedimage",
+        "uploaded",
+        "image",
+        "",
+    )
+    if stubby:
+        raise RuntimeError("caption_seed_image returned an empty/stub title")
+    return SeedCaption(page_title=title[:80], query=query[:160], description=description[:400])
 
 
 def _world_size_hint(entry: dict[str, Any]) -> str:
@@ -526,7 +646,12 @@ async def rewrite_motion_prompt(
         user_text_parts.append(f"Scene description: {page_prompt.strip()}")
     user_text = "\n".join(user_text_parts)
 
-    from obs import span
+    from obs import log, span
+
+    # gemini-3-flash (default VLM) spends thinking tokens against max_tokens.
+    # 160 used to leave only a few visible tokens → mid-word truncations like
+    # "A slow dolly-". Budget must cover thinking + the ~45-word sentence.
+    _MOTION_MAX_TOKENS = 1024
 
     try:
         async with span("llm.rewrite_motion") as ctx:
@@ -550,7 +675,7 @@ async def rewrite_motion_prompt(
                         },
                     ],
                     temperature=0.4,
-                    max_tokens=160,
+                    max_tokens=_MOTION_MAX_TOKENS,
                 )
             else:
                 response = await client.chat.completions.create(
@@ -560,11 +685,28 @@ async def rewrite_motion_prompt(
                         {"role": "user", "content": user_text},
                     ],
                     temperature=0.4,
-                    max_tokens=160,
+                    max_tokens=_MOTION_MAX_TOKENS,
                 )
             _log_cache_usage(ctx, response)
-        rewritten = (response.choices[0].message.content or "").strip()
-        return rewritten or seed
+            choice = response.choices[0]
+            rewritten = (choice.message.content or "").strip().strip("\"'")
+            finish = (getattr(choice, "finish_reason", None) or "").lower()
+            if finish:
+                ctx["finish_reason"] = finish
+            # Reject truncated / half-baked rewrites rather than feeding fal garbage.
+            too_short = len(rewritten.split()) < 8
+            cut_mid_word = rewritten.endswith("-") or rewritten.endswith(",")
+            hit_length = finish in ("length", "max_tokens")
+            if not rewritten or too_short or cut_mid_word or hit_length:
+                log(
+                    "warn",
+                    "animate.motion_rewrite_rejected",
+                    finish_reason=finish or None,
+                    rewritten_head=rewritten[:80],
+                    word_count=len(rewritten.split()),
+                )
+                return seed
+            return rewritten
     except Exception:
         return seed
 
