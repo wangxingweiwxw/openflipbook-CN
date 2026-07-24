@@ -120,7 +120,17 @@ async def stream_tap(
         )
         cleaned_user_hint = _sanitize_hint(body.click_hint, 240)
         cleaned_surroundings = _sanitize_hint(body.prefetched_surroundings, 240)
-        prefetched_ok = bool(cleaned_subject)
+        # Prefetch that restates the parent title is the stuck-trail failure
+        # mode (empty VLM → parent_title fallback cached on hover). Force a
+        # real in-band resolve so the next page can drill into a local detail.
+        parent_echo_refs = (
+            body.parent_title,
+            body.parent_query,
+            body.query,
+        )
+        prefetched_ok = bool(cleaned_subject) and not llm.subject_echoes_parent(
+            cleaned_subject, *parent_echo_refs
+        )
         if prefetched_ok:
             effective_query = cleaned_subject
             style_anchor = cleaned_style or None
@@ -154,6 +164,29 @@ async def stream_tap(
                 # call, so the in-band resolve only needs the classification.
                 autonomy="auto",
             )
+            # Silent failure / lazy overall-theme read: subject equals the
+            # parent title (or the seed query). One retry with the multi-turn
+            # "pick something DIFFERENT" nudge before accepting it.
+            if resolution.subject and llm.subject_echoes_parent(
+                resolution.subject, *parent_echo_refs
+            ):
+                log(
+                    "warn",
+                    "click.parent_echo_retry",
+                    subject=resolution.subject[:80],
+                )
+                resolution = await llm.click_to_subject(
+                    image_data_url=body.image,
+                    x_pct=body.click.x_pct,
+                    y_pct=body.click.y_pct,
+                    parent_title=body.parent_title or body.query,
+                    parent_query=body.parent_query or body.query,
+                    output_locale=body.output_locale,
+                    user_hint=cleaned_user_hint or None,
+                    prior_rejected_subject=resolution.subject,
+                    world_mode=effective_world_mode,
+                    autonomy="auto",
+                )
             # In world mode, let the classifier's read pick the framing
             # unless the request already pinned one.
             if effective_world_mode and not render_mode:
@@ -162,11 +195,27 @@ async def stream_tap(
                 )
             if resolution.subject:
                 effective_query = resolution.subject
+                # Still collapsed onto the parent theme after retry (empty
+                # VLM JSON → parent_title fallback, or portrait-only page).
+                # Refuse to replan the same page — force a component drill-in.
+                if llm.subject_echoes_parent(effective_query, *parent_echo_refs):
+                    parent_label = (
+                        body.parent_title or body.parent_query or body.query or ""
+                    ).strip()
+                    effective_query = (
+                        f'one concrete detail or object inside "{parent_label}", '
+                        "not the whole subject again"
+                    )
+                    log(
+                        "warn",
+                        "click.parent_echo_forced_detail",
+                        parent=parent_label[:80],
+                    )
                 yield _sse(
                     {
                         "type": "status",
                         "stage": "click_resolved",
-                        "subject": resolution.subject,
+                        "subject": effective_query,
                         "groundable": resolution.groundable,
                         "confidence": resolution.confidence,
                         "point": (
@@ -267,6 +316,11 @@ async def stream_tap(
         composed_prompt = (
             f"Style: {style_anchor}\n\n{composed_prompt}"
         )
+    # Optional cartoon brief in FRONT of the (still intact) default prompt —
+    # does not replace style_anchor / planner output.
+    from providers.prompt_library.style import maybe_prepend_cartoon_style
+
+    composed_prompt = maybe_prepend_cartoon_style(composed_prompt)
     # Stepping INSIDE a place is an immersive scene, not a diagram — rendering
     # the facts as on-image "Labels to include" turns the interior into an
     # annotated diagram (floating captions), breaking the seamless step-in.

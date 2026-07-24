@@ -151,6 +151,9 @@ async def stream_expand(
         prompt = plan.prompt
         if expand_style_lock:
             prompt = f"Style: {expand_style_lock}\n\n{prompt}"
+        from providers.prompt_library.style import maybe_prepend_cartoon_style
+
+        prompt = maybe_prepend_cartoon_style(prompt)
         if plan.facts and not body.suppress_map_labels:
             prompt += "\n\nLabels to include:\n- " + "\n- ".join(plan.facts)
         if body.suppress_map_labels:
