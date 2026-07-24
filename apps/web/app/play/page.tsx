@@ -24,7 +24,6 @@ import {
 } from "@/lib/image-click";
 import { entityAtPoint, padBox, type EntityHit } from "@/lib/entity-hit";
 import { applyPlanInstruction } from "@/lib/geo-to-edit";
-import { coachPreDefault } from "@/lib/coach";
 import {
   getWSUrl,
   startLTXStream,
@@ -45,6 +44,7 @@ import {
   nowMs,
 } from "@/lib/trace";
 import { getStrings, resolveOutputLocale } from "@/lib/i18n";
+import { subjectEchoesParent } from "@/lib/subject-echo";
 import { useImageTier, useVideoTier } from "@/hooks/usePersistedTier";
 import { useLoopKnobs, wireFields } from "@/hooks/useSpeedPreset";
 import { useSharedSession } from "@/hooks/useSharedSession";
@@ -60,9 +60,6 @@ import { useStyleGalleryDismissed } from "@/hooks/useStyleGalleryDismissed";
 import { useTraceEmitter } from "@/hooks/useTraceEmitter";
 import { QueryToolbar } from "@/components/PlayPage/QueryToolbar";
 import { StyleGallery } from "@/components/PlayPage/StyleGallery";
-import { FirstRunCoach } from "@/components/PlayPage/FirstRunCoach";
-import { TapHint } from "@/components/PlayPage/TapHint";
-import { BloomGlyph } from "@/components/PlayPage/BloomGlyph";
 import { MorphImagePair } from "@/components/PlayPage/MorphImagePair";
 import { StrokeOverlay } from "@/components/PlayPage/StrokeOverlay";
 import { ClickRipple } from "@/components/PlayPage/ClickRipple";
@@ -146,10 +143,6 @@ const EDIT_REGION_ENABLED = ["1", "true", "yes"].includes(
 // through exactly (same semantics as ENTER_EDIT_REF's kill-switch).
 const WORLD_TAP_DEGRADE_ENABLED = !["0", "false", "no"].includes(
   (process.env.NEXT_PUBLIC_WORLD_TAP_DEGRADE ?? "").toLowerCase()
-);
-// On-ramp coach: pre-first-page hint + existing post-first-page chip (default OFF).
-const ON_RAMP_COACH_ENABLED = ["1", "true", "yes"].includes(
-  (process.env.NEXT_PUBLIC_ON_RAMP_COACH ?? "").toLowerCase(),
 );
 // Enter-coach (default OFF): phrase the world hint as an action ("tap a glowing
 // place to enter") rather than the passive "rings = enterable places" — the UX
@@ -326,46 +319,6 @@ export default function PlayPage() {
     if (typeof window === "undefined") return "";
     return new URLSearchParams(window.location.search).get("q") ?? "";
   });
-  // Coach visibility (the on-ramp): a `?coach=0|1` URL param or the build flag
-  // win when set; otherwise the PRE hint shows ONCE for a genuine first-timer
-  // (no prior `lastSession`, not dismissed) and stays out of a returning user's
-  // way — see lib/coach.coachPreDefault. Additive: existing overrides unchanged.
-  const [coachEnabled] = useState(() => {
-    if (typeof window === "undefined") return ON_RAMP_COACH_ENABLED;
-    // `hadPriorUse` = actual prior navigation (a past session); `dismissed` =
-    // an explicit × earlier. They're independent signals — a newcomer who
-    // dismisses before ever generating sets coachSeen but no lastSession.
-    let hadPriorUse = false;
-    let dismissed = false;
-    try {
-      hadPriorUse = !!window.localStorage.getItem("openflipbook.lastSession");
-      dismissed = window.localStorage.getItem("openflipbook.coachSeen") === "1";
-    } catch {
-      /* privacy mode — treat as a first-timer, the hint is harmless */
-    }
-    return coachPreDefault({
-      urlParam: new URLSearchParams(window.location.search).get("coach"),
-      envValue: process.env.NEXT_PUBLIC_ON_RAMP_COACH ?? null,
-      hadPriorUse,
-      dismissed,
-    });
-  });
-  // The × on the coach retires it for good (persisted) and hides it now.
-  const [coachDismissed, setCoachDismissed] = useState(false);
-  const dismissCoach = useCallback(() => {
-    setCoachDismissed(true);
-    try {
-      window.localStorage.setItem("openflipbook.coachSeen", "1");
-    } catch {
-      /* no-op */
-    }
-  }, []);
-  // `coachEnabled` resolves to a CLIENT-only value (the first-timer heuristic
-  // reads localStorage), so the coach must not render during SSR or it triggers
-  // a hydration mismatch. Gate it on mount: server + first client render agree
-  // (no coach), then the effect reveals it. It was never in the SSR HTML anyway.
-  const [coachMounted, setCoachMounted] = useState(false);
-  useEffect(() => setCoachMounted(true), []);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState<Page | null>(null);
@@ -491,7 +444,6 @@ export default function PlayPage() {
   // `final` event. Used to overlay a subtle breathing blur so the user
   // reads the draft as in-progress, not done.
   const [progressiveDraft, setProgressiveDraft] = useState(false);
-  const [beaconsHidden, setBeaconsHidden] = useState(false);
   // Right-click target resolution (E2): the menu is geo-aware — `hit` is the
   // codex entity under the cursor (per-node bbox containment), `clickPct` the
   // normalized image point (null when the click landed outside the content,
@@ -634,19 +586,22 @@ export default function PlayPage() {
   // Persisted-preference state: render with the SSR-safe default on first
   // paint, then hydrate from localStorage in an effect. Reading localStorage
   // inside the useState initializer causes React 19 to bail out of hydration
-  // on this subtree when the stored value diverges from SSR — symptom is that
-  // the first click on a tier/theme button "doesn't take" until a re-render
-  // settles. theme-init.js paints the correct `data-theme` on <html> before
-  // hydration; the per-effect firstRun guards keep these effects from
-  // overwriting that initial paint with the default values on mount.
-  const [imageTier, setImageTier] = useImageTier();
-  const [loopKnobs, setLoopKnobs] = useLoopKnobs();
+  // on this subtree when the stored value diverges from SSR. theme-init.js
+  // paints the correct `data-theme` on <html> before hydration; the
+  // per-effect firstRun guards keep these effects from overwriting that
+  // initial paint with the default values on mount. Locale / tier / speed /
+  // theme knobs are no longer in the toolbar — defaults + localStorage still
+  // feed generate requests.
+  const [imageTier] = useImageTier();
+  const [loopKnobs] = useLoopKnobs();
   // Running spend estimate for THIS session, read off final frames (the
-  // backend meter, providers/spend.py). Null until the first final lands.
-  const [sessionSpend, setSessionSpend] = useState<number | null>(null);
+  // backend meter, providers/spend.py). Kept for telemetry even though the
+  // toolbar no longer surfaces it.
+  const [, setSessionSpend] = useState<number | null>(null);
   // Dev-only explicit model override (NEXT_PUBLIC_DEV_PROVIDERS): rides the
   // wire's image_model on every generate body. null = the tier decides.
-  const [devModel, setDevModel] = useState<string | null>(null);
+  // Toolbar UI removed; leave null unless a future debug surface sets it.
+  const [devModel] = useState<string | null>(null);
   // Read-along shared sessions (Wave 8): live viewer count + a click-to-open
   // chip when a co-viewer adds a page this tab hasn't seen.
   const knownNodeIds = useMemo(
@@ -662,9 +617,9 @@ export default function PlayPage() {
   // The speed preset's wire half — spread into every generate() body next to
   // image_tier. Balanced knobs produce {} (byte-identity with today).
   const loopWire = useMemo(() => wireFields(loopKnobs), [loopKnobs]);
-  const [videoTier, setVideoTier] = useVideoTier();
-  const [outputLocale, setOutputLocale] = usePersistedLocale();
-  const [theme, setTheme] = usePersistedTheme();
+  const [videoTier] = useVideoTier();
+  const [outputLocale] = usePersistedLocale();
+  usePersistedTheme();
   const t = getStrings(outputLocale);
 
   const [editMode, setEditMode] = useState(false);
@@ -730,8 +685,6 @@ export default function PlayPage() {
   // Hook owns load/save (keyed by sessionId) and the toggle round-trip.
   const {
     anchor: styleAnchor,
-    pending: styleAnchorPending,
-    togglePin,
     setFromPreset,
   } = useStyleAnchor(sessionId);
   // World Mode (per-session, off by default): a tap ENTERS the tapped place
@@ -747,16 +700,6 @@ export default function PlayPage() {
   } = useWorldMode(sessionId);
   const [styleGalleryDismissed, dismissStyleGallery] =
     useStyleGalleryDismissed(sessionId);
-  const togglePinStyle = useCallback(
-    () =>
-      togglePin({
-        nodeId: page?.nodeId ?? null,
-        imageDataUrl: page?.imageDataUrl ?? null,
-        title: page?.title ?? "",
-        query: page?.query ?? null,
-      }),
-    [page, togglePin],
-  );
 
   // Hover-prefetch cache. Keyed by `${nodeId}:${xBucket}:${yBucket}` so two
   // hovers within a 5% grid cell reuse the same VLM round-trip.
@@ -811,6 +754,10 @@ export default function PlayPage() {
         let buffer = "";
         let lastTitle = body.query;
         let lastImage: string | null = null;
+        // Tap path: remember the VLM-resolved click subject so the child
+        // page stores that as its `query` (not the seed). Otherwise every
+        // descendant keeps parent_query="明朝崇祯皇帝" and trails stick.
+        let resolvedSubject: string | null = null;
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
@@ -832,6 +779,7 @@ export default function PlayPage() {
                 t: nowMs(),
               });
               if (evt.stage === "click_resolved" && evt.subject) {
+                resolvedSubject = evt.subject;
                 setStatusMsg(`Exploring "${evt.subject}"…`);
               } else if (evt.stage === "planning") {
                 setStatusMsg("Planning page…");
@@ -873,6 +821,15 @@ export default function PlayPage() {
               const evtSources: Citation[] = Array.isArray(evt.sources)
                 ? evt.sources
                 : [];
+              // Child query: prefer the resolved click subject on taps so
+              // the next hop's parent_query is what you actually drilled
+              // into — not the original seed forever.
+              const childQuery =
+                body.mode === "tap" && resolvedSubject
+                  ? resolvedSubject
+                  : body.mode === "tap"
+                    ? evt.page_title || body.query
+                    : body.query;
               hudEmit("sse:final", {
                 page_title: evt.page_title,
                 image_model: evt.image_model,
@@ -886,10 +843,14 @@ export default function PlayPage() {
               setPage({
                 nodeId: null,
                 sessionId: evt.session_id,
-                query: body.query,
+                query: childQuery,
                 title: evt.page_title,
                 imageDataUrl: evt.image_data_url,
                 sources: evtSources,
+                // Always stamp the parent link here — persist's follow-up
+                // setPage used to only patch nodeId, leaving parentId unset
+                // on the live page (upload button + world-root checks broke).
+                parentId: body.current_node_id || null,
                 // Mirror the persist body: an edit is a REVISION. Tap/fresh
                 // stay absent = descend.
                 ...(body.mode === "edit" ? { relation: "edit" as const } : {}),
@@ -923,7 +884,7 @@ export default function PlayPage() {
                 {
                   parent_id: body.current_node_id || null,
                   session_id: evt.session_id,
-                  query: body.query,
+                  query: childQuery,
                   page_title: evt.page_title,
                   image_data_url: evt.image_data_url,
                   image_model: evt.image_model,
@@ -957,7 +918,7 @@ export default function PlayPage() {
                   const persisted: Page = {
                     nodeId: saved.id,
                     sessionId: evt.session_id,
-                    query: body.query,
+                    query: childQuery,
                     title: evt.page_title,
                     imageDataUrl: evt.image_data_url,
                     parentId: body.current_node_id || null,
@@ -982,6 +943,7 @@ export default function PlayPage() {
                       ? {
                           ...prev,
                           nodeId: saved.id,
+                          parentId: body.current_node_id || null,
                           sceneView: body.scene_view
                             ? { ...body.scene_view, node_id: saved.id }
                             : null,
@@ -1160,8 +1122,57 @@ export default function PlayPage() {
         abortRef.current?.abort();
         const ac = new AbortController();
         abortRef.current = ac;
-        const seedTitle = "Uploaded image";
-        const seedQuery = "Uploaded image";
+        // Show the image immediately; replace the stub title once the VLM
+        // captions the seed so later taps plan against the real theme.
+        const provisionalTitle = "识别主题中…";
+        setPage({
+          nodeId: null,
+          sessionId,
+          query: provisionalTitle,
+          title: provisionalTitle,
+          imageDataUrl: dataUrl,
+        });
+        setPhase("ready");
+        setError(null);
+        setStatusMsg("Reading image theme…");
+        const uploadTrace = newTraceId();
+        bindTrace(uploadTrace);
+
+        let seedTitle = "Uploaded image";
+        let seedQuery = "Uploaded image";
+        let seedDescription: string | null = null;
+        try {
+          const capRes = await fetch("/api/caption-seed", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              [TRACE_HEADER]: uploadTrace,
+            },
+            body: JSON.stringify({
+              image_data_url: dataUrl,
+              output_locale: resolveOutputLocale(outputLocale),
+            }),
+            signal: ac.signal,
+          });
+          if (capRes.ok) {
+            const cap = (await capRes.json()) as {
+              page_title?: string;
+              query?: string;
+              description?: string;
+            };
+            const titled = (cap.page_title || "").trim();
+            if (titled) {
+              seedTitle = titled;
+              seedQuery = (cap.query || "").trim() || titled;
+              seedDescription = (cap.description || "").trim() || null;
+            }
+          }
+        } catch {
+          // Fall through to the stub — better a weak parent_title than a
+          // blocked upload when the VLM/proxy is down.
+        }
+        if (ac.signal.aborted) return;
+
         setPage({
           nodeId: null,
           sessionId,
@@ -1169,11 +1180,8 @@ export default function PlayPage() {
           title: seedTitle,
           imageDataUrl: dataUrl,
         });
-        setPhase("ready");
-        setError(null);
         setStatusMsg(null);
-        const uploadTrace = newTraceId();
-        bindTrace(uploadTrace);
+
         void persistNode(
           {
             parent_id: null,
@@ -1184,7 +1192,7 @@ export default function PlayPage() {
             image_model: "user-upload",
             prompt_author_model: "user-upload",
             aspect_ratio: "16:9",
-            final_prompt: "",
+            final_prompt: seedDescription ?? "",
           },
           uploadTrace
         ).then((saved) => {
@@ -1198,7 +1206,11 @@ export default function PlayPage() {
               imageDataUrl: dataUrl,
               parentId: null,
             };
-            setPage((prev) => (prev ? { ...prev, nodeId: saved.id } : prev));
+            setPage((prev) =>
+              prev
+                ? { ...prev, nodeId: saved.id, title: seedTitle, query: seedQuery }
+                : prev
+            );
             const newId = saved.id;
             setHistory((prev) => {
               const existingIdx = prev.items.findIndex(
@@ -1224,6 +1236,7 @@ export default function PlayPage() {
               nodeId: saved.id,
               imageDataUrl: dataUrl,
               caption: seedTitle,
+              sceneDescription: seedDescription,
               traceId: uploadTrace,
             });
           }
@@ -1233,7 +1246,7 @@ export default function PlayPage() {
         setPhase("error");
       }
     },
-    [sessionId, bindTrace]
+    [sessionId, bindTrace, outputLocale]
   );
 
   const onFileInputChange = useCallback(
@@ -1624,9 +1637,14 @@ export default function PlayPage() {
     // route walks the chain; these just open the download.
     if (page?.nodeId) {
       const exportId = page.nodeId;
+      const exportLabels = {
+        pdf: "导出路径（PDF 格式）",
+        zip: "导出路径（ZIP 压缩包）",
+        gif: "导出路径（GIF 动图）",
+      } as const;
       for (const fmt of ["pdf", "zip", "gif"] as const) {
         items.push({
-          label: `Export path (${fmt.toUpperCase()})`,
+          label: exportLabels[fmt],
           onClick: () => {
             close();
             window.open(`/api/export/${exportId}?fmt=${fmt}`, "_blank");
@@ -1636,7 +1654,7 @@ export default function PlayPage() {
       // Opt-in gallery (Wave 7): this page fronts the published session.
       const publishSessionId = page.sessionId;
       items.push({
-        label: "Publish session to gallery",
+        label: "将会话发布至作品画廊",
         onClick: () => {
           close();
           void fetch("/api/gallery/publish", {
@@ -1659,7 +1677,8 @@ export default function PlayPage() {
         },
       });
       items.push({
-        label: "Unpublish session",
+        label: "取消该会话的发布",
+        danger: true,
         onClick: () => {
           close();
           void fetch(
@@ -1938,6 +1957,9 @@ export default function PlayPage() {
         const scope = nodeId;
         for (const c of data.candidates) {
           if ((counts.get(scope) ?? 0) >= PREFETCH_PER_PAGE) break;
+          // Skip candidates that just restate the page title — those would
+          // short-circuit every nearby tap into the same theme.
+          if (subjectEchoesParent(c.subject, page.title, page.query)) continue;
           const key = bucketKey(nodeId, c.x_pct, c.y_pct);
           if (cache.has(key)) continue;
           cache.set(key, { subject: c.subject, style: c.style });
@@ -2025,6 +2047,13 @@ export default function PlayPage() {
             bbox?: { x: number; y: number; w: number; h: number } | null;
           };
           if (data.subject) {
+            // Don't cache parent-title echoes — they'd short-circuit the
+            // next tap into regenerating the same page.
+            if (
+              subjectEchoesParent(data.subject, page.title, page.query)
+            ) {
+              return;
+            }
             cache.set(key, {
               subject: data.subject,
               style: data.style ?? "",
@@ -2289,10 +2318,17 @@ export default function PlayPage() {
       // ignore the angle they just typed.
       // In World Mode we skip the hover-prefetch shortcut so the backend always
       // classifies the tap (scene / sub-map / explainer) and frames the page.
-      const cached =
+      // Also skip when the cached subject just restates this page's title
+      // (stuck-trail mode from empty-VLM → parent_title fallback).
+      const rawCached =
         hint || worldEnabled
           ? undefined
           : cache.get(bucketKey(currentNodeId, click.x_pct, click.y_pct));
+      const cached =
+        rawCached &&
+        !subjectEchoesParent(rawCached.subject, page.title, page.query)
+          ? rawCached
+          : undefined;
       // HUD visibility for the silent hover warming (UI_AUDIT #10): count
       // only clicks where the shortcut was eligible — a deliberate skip
       // (hint / world mode) is neither a hit nor a miss.
@@ -3016,23 +3052,18 @@ export default function PlayPage() {
         fileInputRef={fileInputRef}
         onFileInputChange={onFileInputChange}
         busy={phase === "generating"}
-        outputLocale={outputLocale}
-        setOutputLocale={setOutputLocale}
-        theme={theme}
-        setTheme={setTheme}
-        imageTier={imageTier}
-        setImageTier={setImageTier}
-        loopKnobs={loopKnobs}
-        setLoopKnobs={setLoopKnobs}
-        sessionSpend={sessionSpend}
-        devModel={devModel}
-        setDevModel={setDevModel}
-        worldMode={worldEnabled}
-        setWorldMode={setWorldEnabled}
-        autonomy={worldAutonomy}
-        setAutonomy={setWorldAutonomy}
-        domLabels={worldDomLabels}
-        setDomLabels={setWorldDomLabels}
+        // Upload is seed-only for the empty /play landing. Live `page.parentId`
+        // is often unset after a tap (final setPage omits it; persist only
+        // patches nodeId), so gating on parentId left the button stuck on.
+        showUpload={!page?.imageDataUrl}
+        onClear={() => {
+          abortRef.current?.abort();
+          streamRef.current?.close();
+          animateAbortRef.current?.abort();
+          // Hard nav to bare /play — drops ?continue=, mints a new sessionId,
+          // wipes in-memory trail/page state. Title matches the hover hint.
+          window.location.assign("/play");
+        }}
       />
 
       {worldEnabled && (
@@ -3088,35 +3119,35 @@ export default function PlayPage() {
               onClick={goBack}
               disabled={!canGoBack}
               className="rounded-full border border-[var(--color-ink)]/40 px-3 py-1 hover:bg-[var(--color-ink)]/5 disabled:opacity-30"
-              title="Go back (←)"
+              title="后退"
             >
-              ← back
+              ← 后退
             </button>
             <button
               type="button"
               onClick={goForward}
               disabled={!canGoForward}
               className="rounded-full border border-[var(--color-ink)]/40 px-3 py-1 hover:bg-[var(--color-ink)]/5 disabled:opacity-30"
-              title="Go forward (→)"
+              title="前进"
             >
-              forward →
+              前进 →
             </button>
             <button
               type="button"
               onClick={() => setViewMode((m) => (m === "map" ? "page" : "map"))}
               className="rounded-full border border-[var(--color-ink)]/40 px-3 py-1 hover:bg-[var(--color-ink)]/5"
-              title="Toggle world map (M)"
+              title={viewMode === "map" ? "返回页面" : "打开地图模式"}
             >
-              {viewMode === "map" ? "📄 page" : "🗺 map"}
+              {viewMode === "map" ? "页面" : "地图"}
             </button>
             <a
               href={`/atlas/${encodeURIComponent(sessionId)}`}
               target="_blank"
               rel="noreferrer"
               className="rounded-full border border-[var(--color-ink)]/40 px-3 py-1 hover:bg-[var(--color-ink)]/5"
-              title="Open this session's atlas in a new tab"
+              title="新窗口中打开画布"
             >
-              ↗ atlas
+              画布
             </a>
           </div>
           <span className="opacity-60">
@@ -3131,20 +3162,6 @@ export default function PlayPage() {
               </span>
             )}
           </span>
-          {shared.incoming && (
-            <button
-              type="button"
-              onClick={() => {
-                const id = shared.incoming?.id;
-                shared.clearIncoming();
-                if (id) selectFromMap(id);
-              }}
-              className="rounded-full border border-emerald-600/40 bg-emerald-50 px-3 py-1 text-xs text-emerald-900 hover:bg-emerald-100"
-              title="A co-viewer added this page — click to open it"
-            >
-              ✦ new: {shared.incoming.title.slice(0, 32)} →
-            </button>
-          )}
           </div>
         </div>
       )}
@@ -3198,40 +3215,6 @@ export default function PlayPage() {
         >
           {page.sources && page.sources.length > 0 && (
             <CitationsChip sources={page.sources} />
-          )}
-          {page.nodeId && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                void togglePinStyle();
-              }}
-              disabled={styleAnchorPending}
-              aria-pressed={styleAnchor?.nodeId === page.nodeId}
-              title={
-                styleAnchor?.nodeId === page.nodeId
-                  ? "Style locked to this page — click to unlock"
-                  : styleAnchor
-                    ? "Pin this page's style for the rest of the session"
-                    : "Pin this page as the session's visual style"
-              }
-              className={
-                "pointer-events-auto absolute bottom-3 start-3 z-10 flex select-none items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium backdrop-blur transition " +
-                (styleAnchor?.nodeId === page.nodeId
-                  ? "border-amber-400/70 bg-amber-100/80 text-amber-900 hover:bg-amber-100"
-                  : "border-[var(--color-ink)]/30 bg-[var(--color-paper)]/80 text-[var(--color-ink)] hover:bg-[var(--color-paper)]") +
-                (styleAnchorPending ? " opacity-60" : "")
-              }
-            >
-              <span aria-hidden>📌</span>
-              <span>
-                {styleAnchorPending
-                  ? "Pinning…"
-                  : styleAnchor?.nodeId === page.nodeId
-                    ? "Style locked"
-                    : "Pin style"}
-              </span>
-            </button>
           )}
           {worldEnabled && (
             <button
@@ -3484,7 +3467,6 @@ export default function PlayPage() {
             </div>
 
             {page?.nodeId &&
-              !beaconsHidden &&
               (streamStatus === "off" || streamStatus === "error") && (
                 <BranchBeacons
                   beacons={history.items
@@ -3508,29 +3490,6 @@ export default function PlayPage() {
 
             {phase === "generating" && <GeneratingBanner statusMsg={statusMsg} />}
 
-            {phase === "ready" &&
-              localizeStatus?.status === "failed" &&
-              localizeStatus.nodeId === page?.nodeId && (
-                <div className="pointer-events-auto absolute bottom-3 left-3 flex items-center gap-3 rounded-full bg-amber-700/90 px-4 py-2 text-xs text-white shadow-lg">
-                  <span>Couldn’t map this page — taps may miss.</span>
-                  <button
-                    type="button"
-                    onClick={() => void localizeCurrentNode()}
-                    className="rounded-full bg-white/20 px-2.5 py-1 font-medium hover:bg-white/30"
-                  >
-                    Map it
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Dismiss"
-                    onClick={() => setLocalizeStatus(null)}
-                    className="text-white/70 hover:text-white"
-                  >
-                    ✕
-                  </button>
-                </div>
-              )}
-
             {phase !== "generating" &&
               streamStatus === "connecting" &&
               !fallbackVideoUrl && (
@@ -3545,135 +3504,7 @@ export default function PlayPage() {
                 </div>
               )}
 
-            {/* Capped + wrapping: at ≤390px this row is wider than the frame
-                and used to hang off BOTH edges — Around/⊞ geo were fully
-                off-screen and untappable (UI_AUDIT #13). Right-anchored with
-                intrinsic width, so desktop renders identically. z-10 matches
-                the World pill so, on any residual overlap at narrow widths,
-                this later-in-DOM toolbar wins the stack and stays tappable. */}
-            <div className="absolute right-3 top-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap justify-end gap-2">
-              <button
-                type="button"
-                onClick={triggerExpand}
-                disabled={
-                  phase === "generating" ||
-                  !page?.imageDataUrl ||
-                  (bloom !== null && !bloom.done)
-                }
-                className="flex items-center gap-1.5 rounded-full bg-teal-600/85 px-3 py-1 text-xs text-white hover:bg-teal-600 disabled:opacity-50"
-                title="Look around (E) — bloom the world around this page (vs tap a region to go in)"
-              >
-                <BloomGlyph className="h-3.5 w-3.5" />
-                Around
-              </button>
-              <button
-                type="button"
-                onClick={() => setGeoOverlayOn((v) => !v)}
-                aria-pressed={geoOverlayOn}
-                disabled={!page?.nodeId}
-                className={
-                  "rounded-full px-3 py-1 text-xs text-white disabled:opacity-50 " +
-                  (geoOverlayOn ? "bg-emerald-600" : "bg-slate-600/85 hover:bg-slate-600")
-                }
-                title="Geometry layer (G) — draw each entity's detected coordinate box on the image"
-              >
-                ⊞ geo
-              </button>
-              <button
-                type="button"
-                onClick={() => setCodexOpen((c) => !c)}
-                aria-pressed={codexOpen}
-                className={
-                  "rounded-full px-3 py-1 text-xs text-white " +
-                  (codexOpen
-                    ? "bg-[var(--color-ink)]"
-                    : "bg-black/60 hover:bg-black/75")
-                }
-                title="Open the world codex (K). Lists every character, place, and item the explorer has seen."
-              >
-                Codex
-                {worldState.entities.length > 0 && (
-                  <span className="ml-1.5 rounded-full bg-white/15 px-1.5 text-[10px] tabular-nums">
-                    {worldState.entities.length}
-                  </span>
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setEditMode((v) => !v);
-                  setEditInstruction("");
-                  setEditRegion(null);
-                  setEditDragRect(null);
-                }}
-                disabled={phase === "generating"}
-                aria-pressed={editMode}
-                className={
-                  "rounded-full px-3 py-1 text-xs text-white disabled:opacity-50 " +
-                  (editMode ? "bg-amber-600" : "bg-black/60 hover:bg-black/75")
-                }
-                title="Edit this image with a text instruction"
-              >
-                {editMode ? t.cancelEdit : t.edit}
-              </button>
-              {!process.env.NEXT_PUBLIC_LTX_WS_URL && streamStatus === "off" && (
-                <div
-                  role="group"
-                  aria-label="Video quality tier"
-                  className="flex items-center overflow-hidden rounded-full border border-white/30 bg-black/60 text-[10px] text-white"
-                  title="Video quality tier — fast (LTX), balanced (Wan 2.2), pro (LTX-2)"
-                >
-                  <span className="px-2 py-1 opacity-70">video</span>
-                  {(["fast", "balanced", "pro"] as const).map((tier) => (
-                    <button
-                      key={tier}
-                      type="button"
-                      onClick={() => setVideoTier(tier)}
-                      aria-pressed={videoTier === tier}
-                      className={
-                        "px-2 py-1 transition-colors " +
-                        (videoTier === tier
-                          ? "bg-white text-black"
-                          : "hover:bg-white/15")
-                      }
-                    >
-                      {tier}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <button
-                type="button"
-                onClick={
-                  streamStatus === "off"
-                    ? fallbackVideoUrl && !showVideo
-                      ? replayVideo
-                      : connectStream
-                    : disconnectStream
-                }
-                className="rounded-full bg-black/60 px-3 py-1 text-xs text-white"
-                title={
-                  fallbackVideoUrl && !showVideo && streamStatus === "off"
-                    ? "Replay the clip you already generated for this page (no new fal call)"
-                    : process.env.NEXT_PUBLIC_LTX_WS_URL
-                      ? "Stream an animated clip from Modal LTX"
-                      : "Generate a 5-second clip via fal-ai/ltx-video (not streaming — full MP4)"
-                }
-              >
-                {streamStatus === "off"
-                  ? fallbackVideoUrl && !showVideo
-                    ? "▶ Replay clip"
-                    : process.env.NEXT_PUBLIC_LTX_WS_URL
-                      ? t.animateStream
-                      : t.animateClip
-                  : streamStatus === "playing"
-                    ? t.animateStop
-                    : streamStatus === "connecting"
-                      ? t.generatingClip
-                      : `… ${streamStatus}`}
-              </button>
-            </div>
-            {editMode ? (
+            {editMode && (
               <EditForm
                 instruction={editInstruction}
                 setInstruction={setEditInstruction}
@@ -3683,8 +3514,6 @@ export default function PlayPage() {
                 applyLabel={t.apply}
                 style={editFormStyle}
               />
-            ) : (
-              <TapHint text={t.tapHint} />
             )}
           </div>
         </figure>
@@ -3761,28 +3590,6 @@ export default function PlayPage() {
         onGeoApplyToImage={geoApplyToImage}
       />
 
-      {/* Hide the coach while the Around tray is open — both are pinned to
-          bottom-centre, so they'd overlap; mid-bloom the hint is noise anyway.
-          It returns when the tray is closed. */}
-      {coachMounted &&
-        !helpOpen &&
-        !bloom &&
-        !coachDismissed &&
-        ((coachEnabled &&
-          history.items.length === 0 &&
-          phase !== "generating") ||
-          (phase === "ready" && history.items.length <= 1)) && (
-          <FirstRunCoach
-            onShowHelp={() => setHelpOpen(true)}
-            worldHint={worldEnabled}
-            enterHintActionable={ENTER_COACH_ENABLED}
-            variant={
-              coachEnabled && history.items.length === 0 ? "pre" : "post"
-            }
-            onDismiss={dismissCoach}
-          />
-        )}
-
       {scrubberOpen && page?.imageDataUrl && history.trail.length > 1 && (
         <TimeScrubber
           frames={history.trail
@@ -3820,12 +3627,7 @@ export default function PlayPage() {
           x={contextMenu.xPx}
           y={contextMenu.yPx}
           extraItems={contextExtraItems}
-          beaconsHidden={beaconsHidden}
           canCopy={!!page?.nodeId}
-          canPrune={
-            !!page?.nodeId &&
-            history.items.some((p) => p.nodeId === page?.nodeId)
-          }
           canSavePostcard={!!page?.nodeId}
           onCopyPermalink={() => {
             if (page?.nodeId) {
@@ -3838,46 +3640,6 @@ export default function PlayPage() {
             if (page?.nodeId) {
               window.open(`/api/postcard/${page.nodeId}?download=1`, "_blank");
             }
-            setContextMenu(null);
-          }}
-          onPrune={() => {
-            setContextMenu(null);
-            if (!page?.nodeId) return;
-            const targetId = page.nodeId;
-            setHistory((prev) => {
-              const subtree = new Set<string>();
-              const queue = [targetId];
-              while (queue.length) {
-                const id = queue.shift()!;
-                if (subtree.has(id)) continue;
-                subtree.add(id);
-                for (const item of prev.items) {
-                  if (item.parentId === id && item.nodeId)
-                    queue.push(item.nodeId);
-                }
-              }
-              const removeCount = subtree.size;
-              if (
-                removeCount > 1 &&
-                !window.confirm(
-                  `Remove this branch and ${removeCount - 1} child page(s) from history? Persisted pages stay on disk.`
-                )
-              ) {
-                return prev;
-              }
-              const items = prev.items.filter(
-                (p) => !p.nodeId || !subtree.has(p.nodeId)
-              );
-              const trail = prev.trail.filter((id) => !subtree.has(id));
-              return {
-                items,
-                trail,
-                trailIdx: trail.length - 1,
-              };
-            });
-          }}
-          onToggleBeacons={() => {
-            setBeaconsHidden((h) => !h);
             setContextMenu(null);
           }}
           onClose={() => setContextMenu(null)}
