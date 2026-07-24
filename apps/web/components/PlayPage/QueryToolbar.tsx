@@ -1,14 +1,8 @@
 "use client";
 
 import type { ChangeEvent, FormEvent, RefObject } from "react";
-import type { Autonomy, ImageTier } from "@openflipbook/config";
 
-import { SUPPORTED_LOCALES, type SupportedLocale, type LocaleStrings } from "@/lib/i18n";
-import { THEMES, type Theme } from "@/hooks/usePersistedTheme";
-import type { LoopKnobs } from "@/hooks/useSpeedPreset";
-import { SpeedPreset } from "./SpeedPreset";
-
-const TIERS: readonly ImageTier[] = ["fast", "balanced", "pro"] as const;
+import type { LocaleStrings } from "@/lib/i18n";
 
 interface Props {
   t: LocaleStrings;
@@ -18,25 +12,16 @@ interface Props {
   fileInputRef: RefObject<HTMLInputElement | null>;
   onFileInputChange: (e: ChangeEvent<HTMLInputElement>) => void;
   busy: boolean;
-  outputLocale: SupportedLocale;
-  setOutputLocale: (l: SupportedLocale) => void;
-  theme: Theme;
-  setTheme: (t: Theme) => void;
-  imageTier: ImageTier;
-  setImageTier: (t: ImageTier) => void;
-  loopKnobs: LoopKnobs;
-  setLoopKnobs: (k: LoopKnobs) => void;
-  sessionSpend?: number | null | undefined;
-  devModel?: string | null | undefined;
-  setDevModel?: ((m: string | null) => void) | undefined;
-  worldMode: boolean;
-  setWorldMode: (on: boolean) => void;
-  autonomy: Autonomy;
-  setAutonomy: (a: Autonomy) => void;
-  domLabels: boolean;
-  setDomLabels: (on: boolean) => void;
+  onClear: () => void;
+  /** Seed upload is a home/root-only action — hide once you've drilled into a child page. */
+  showUpload?: boolean;
 }
 
+/**
+ * Top chrome on /play: query + upload + clear + go.
+ * Locale / theme / image tier / speed / spend / world stay on their hooks in
+ * page.tsx (defaults + localStorage) — just not in this bar.
+ */
 export function QueryToolbar({
   t,
   input,
@@ -45,23 +30,8 @@ export function QueryToolbar({
   fileInputRef,
   onFileInputChange,
   busy,
-  outputLocale,
-  setOutputLocale,
-  theme,
-  setTheme,
-  imageTier,
-  setImageTier,
-  loopKnobs,
-  setLoopKnobs,
-  sessionSpend,
-  devModel,
-  setDevModel,
-  worldMode,
-  setWorldMode,
-  autonomy,
-  setAutonomy,
-  domLabels,
-  setDomLabels,
+  onClear,
+  showUpload = true,
 }: Props) {
   return (
     <>
@@ -76,149 +46,25 @@ export function QueryToolbar({
           value={input}
           onChange={(e) => onInputChange(e.target.value)}
         />
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={busy}
-          className="rounded-full border border-[var(--color-edge)] px-3 py-1 text-xs hover:bg-[var(--color-ink)]/5 disabled:opacity-40"
-          title="Upload an image as the starting page. Tap on it to explore regions."
-        >
-          {t.upload}
-        </button>
-        <select
-          value={outputLocale}
-          onChange={(e) => setOutputLocale(e.target.value as SupportedLocale)}
-          disabled={busy}
-          aria-label={t.langLabel}
-          title={t.langLabel}
-          className="rounded-full border border-[var(--color-edge)] bg-transparent px-2 py-1 text-xs disabled:opacity-40"
-        >
-          {SUPPORTED_LOCALES.map((loc) => (
-            <option key={loc} value={loc}>
-              {loc === "auto" ? t.langAuto : loc}
-            </option>
-          ))}
-        </select>
-        <div
-          role="group"
-          aria-label="Theme"
-          className="flex items-center overflow-hidden rounded-full border border-[var(--color-edge)] text-xs"
-          title="Theme — light / sepia / dark"
-        >
-          {THEMES.map((th) => (
-            <button
-              key={th}
-              type="button"
-              onClick={() => setTheme(th)}
-              aria-pressed={theme === th}
-              className={
-                "px-2.5 py-1 transition-colors " +
-                (theme === th
-                  ? "bg-[var(--color-ink)] text-[var(--color-canvas)]"
-                  : "hover:bg-[var(--color-ink)]/5")
-              }
-            >
-              {th === "light"
-                ? t.themeLight
-                : th === "sepia"
-                  ? t.themeSepia
-                  : t.themeDark}
-            </button>
-          ))}
-        </div>
-        <div
-          role="group"
-          aria-label="Image quality tier"
-          className="flex items-center overflow-hidden rounded-full border border-[var(--color-edge)] text-xs"
-          title="Image quality tier — fast (cheap), balanced (default), pro (premium)"
-        >
-          <span className="px-2 py-1 opacity-60">image</span>
-          {TIERS.map((tier) => (
-            <button
-              key={tier}
-              type="button"
-              onClick={() => setImageTier(tier)}
-              disabled={busy}
-              aria-pressed={imageTier === tier}
-              className={
-                "px-2.5 py-1 transition-colors disabled:opacity-40 " +
-                (imageTier === tier
-                  ? "bg-[var(--color-ink)] text-[var(--color-canvas)]"
-                  : "hover:bg-[var(--color-ink)]/5")
-              }
-            >
-              {tier}
-            </button>
-          ))}
-        </div>
-        <SpeedPreset
-          busy={busy}
-          imageTier={imageTier}
-          setImageTier={setImageTier}
-          knobs={loopKnobs}
-          setKnobs={setLoopKnobs}
-          sessionSpend={sessionSpend}
-          devModel={devModel}
-          setDevModel={setDevModel}
-        />
-        <div
-          role="group"
-          aria-label="World Mode"
-          className="flex items-center overflow-hidden rounded-full border border-[var(--color-edge)] text-xs"
-          title="World Mode — tap to ENTER places (immersive scenes / closer sub-maps) instead of explaining a topic; entered places persist and reopen."
-        >
+        {showUpload ? (
           <button
             type="button"
-            onClick={() => setWorldMode(!worldMode)}
-            aria-pressed={worldMode}
-            className={
-              "px-2.5 py-1 transition-colors " +
-              (worldMode
-                ? "bg-[var(--color-ink)] text-[var(--color-canvas)]"
-                : "hover:bg-[var(--color-ink)]/5")
-            }
+            onClick={() => fileInputRef.current?.click()}
+            disabled={busy}
+            className="rounded-full border border-[var(--color-edge)] px-3 py-1 text-xs hover:bg-[var(--color-ink)]/5 disabled:opacity-40"
+            title="Upload an image as the starting page. Tap on it to explore regions."
           >
-            world
+            {t.upload}
           </button>
-          {worldMode &&
-            (["auto", "semi"] as const).map((a) => (
-              <button
-                key={a}
-                type="button"
-                onClick={() => setAutonomy(a)}
-                aria-pressed={autonomy === a}
-                title={
-                  a === "auto"
-                    ? "Auto — enter straight away"
-                    : "Semi — ask a quick question first"
-                }
-                className={
-                  "px-2.5 py-1 transition-colors " +
-                  (autonomy === a
-                    ? "bg-[var(--color-ink)] text-[var(--color-canvas)]"
-                    : "hover:bg-[var(--color-ink)]/5")
-                }
-              >
-                {a}
-              </button>
-            ))}
-          {worldMode && (
-            <button
-              type="button"
-              onClick={() => setDomLabels(!domLabels)}
-              aria-pressed={domLabels}
-              title="DOM labels — maps render with no baked text; place names overlay the image (crisper lettering, names never break clicks)"
-              className={
-                "px-2.5 py-1 transition-colors " +
-                (domLabels
-                  ? "bg-[var(--color-ink)] text-[var(--color-canvas)]"
-                  : "hover:bg-[var(--color-ink)]/5")
-              }
-            >
-              labels
-            </button>
-          )}
-        </div>
+        ) : null}
+        <button
+          type="button"
+          onClick={onClear}
+          title="clear history"
+          className="rounded-full bg-black px-3 py-1 text-xs font-medium text-white hover:bg-black/85"
+        >
+          clear
+        </button>
         <button
           type="submit"
           disabled={busy || input.trim().length === 0}
@@ -228,13 +74,15 @@ export function QueryToolbar({
         </button>
       </form>
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        className="hidden"
-        onChange={onFileInputChange}
-      />
+      {showUpload ? (
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={onFileInputChange}
+        />
+      ) : null}
     </>
   );
 }
