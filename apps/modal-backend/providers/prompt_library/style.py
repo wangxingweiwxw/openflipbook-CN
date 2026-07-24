@@ -18,6 +18,26 @@ NO_LETTERING = (
     "the interface overlays names separately."
 )
 
+# Prepended (not a style_anchor override) when EXPLAINER_CARTOON_STYLE=1.
+# Lands at the very front of the composed image prompt; planner output and
+# any `Style: …` lock stay intact after it.
+CARTOON_HANDDRAWN_PREAMBLE = (
+    "儿童绘本风格：白底，柔和暖色，搭配简单 shapes；天真、充满奇思妙想的故事插画。俏皮且甜美。"
+)
+
+
+def maybe_prepend_cartoon_style(prompt: str) -> str:
+    """If ``EXPLAINER_CARTOON_STYLE`` is on, put the cartoon brief in front of
+    ``prompt`` without replacing it. Flag default off → byte-identical."""
+    from _env import env_flag
+
+    if not env_flag("EXPLAINER_CARTOON_STYLE"):
+        return prompt
+    body = (prompt or "").strip()
+    if not body:
+        return CARTOON_HANDDRAWN_PREAMBLE
+    return f"{CARTOON_HANDDRAWN_PREAMBLE}\n\n{body}"
+
 
 def medium_lock(style_anchor: str | None, *, ref_name: str = "the reference") -> str:
     """The keep-this-exact-medium sentence, with or without a named anchor.
